@@ -7,6 +7,8 @@ Real-time dashboard for EUR/USD and GBP/USD with ICT concepts:
 - Fair Value Gaps (FVG)
 - Liquidity Sweeps (Asian Range, PDH/PDL)
 - SMT Divergence (EUR/USD vs GBP/USD)
+- Directional Bias Engine (H4 swing structure analysis)
+- Draw on Liquidity (DOL – distance to PDH/PDL target)
 """
 
 import streamlit as st
@@ -26,11 +28,11 @@ NY_TZ = pytz.timezone("America/New_York")
 YFINANCE_SYMBOLS = {"EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X"}
 TWELVEDATA_SYMBOLS = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
 
-TIMEFRAME_MAP_YF = {"5m": "5m", "15m": "15m", "1h": "60m"}
-TIMEFRAME_MAP_TD = {"5m": "5min", "15m": "15min", "1h": "1h"}
+TIMEFRAME_MAP_YF = {"5m": "5m", "15m": "15m", "1h": "60m", "4h": "60m"}
+TIMEFRAME_MAP_TD = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
 
 # How many calendar days of history to request for each timeframe
-PERIOD_DAYS = {"5m": 5, "15m": 14, "1h": 30}
+PERIOD_DAYS = {"5m": 5, "15m": 14, "1h": 30, "4h": 60}
 
 
 def fetch_data_yfinance(symbol: str, timeframe: str) -> pd.DataFrame:
@@ -98,9 +100,27 @@ def fetch_data_twelvedata(symbol: str, timeframe: str, api_key: str) -> pd.DataF
     return ts
 
 
+def _resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample 1h OHLC data to 4h bars."""
+    if df.empty:
+        return df
+    resampled = df.resample("4h").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }).dropna()
+    resampled.index.name = "datetime"
+    return resampled
+
+
 def fetch_data(symbol: str, timeframe: str, source: str, api_key: str = "") -> pd.DataFrame:
     if source == "TwelveData":
         return fetch_data_twelvedata(symbol, timeframe, api_key)
+    if timeframe == "4h":
+        # yfinance has no native 4h interval; fetch 1h and resample
+        df_1h = fetch_data_yfinance(symbol, "4h")  # uses 60m interval with 60-day window
+        return _resample_to_4h(df_1h)
     return fetch_data_yfinance(symbol, timeframe)
 
 
@@ -423,6 +443,148 @@ def detect_smt_divergence(
 
 
 # ---------------------------------------------------------------------------
+# ICT Logic – Directional Bias Engine (H4)
+# ---------------------------------------------------------------------------
+
+def _find_swing_points(df: pd.DataFrame, order: int = 3) -> tuple[list[dict], list[dict]]:
+    """
+    Identify swing highs and swing lows using a rolling window comparison.
+    A swing high at index i requires the high to be the max of
+    [i-order .. i+order]. Similarly for swing lows.
+    Returns (swing_highs, swing_lows) each as list of {index, price, time}.
+    """
+    swing_highs = []
+    swing_lows = []
+    highs = df["high"].values
+    lows = df["low"].values
+    timestamps = df.index
+
+    for i in range(order, len(df) - order):
+        # Swing high: highest in the window
+        window_highs = highs[i - order: i + order + 1]
+        if highs[i] == window_highs.max() and np.sum(window_highs == highs[i]) == 1:
+            swing_highs.append({"idx": i, "price": float(highs[i]), "time": timestamps[i]})
+        # Swing low: lowest in the window
+        window_lows = lows[i - order: i + order + 1]
+        if lows[i] == window_lows.min() and np.sum(window_lows == lows[i]) == 1:
+            swing_lows.append({"idx": i, "price": float(lows[i]), "time": timestamps[i]})
+
+    return swing_highs, swing_lows
+
+
+def determine_h4_bias(df_h4: pd.DataFrame) -> dict:
+    """
+    Analyse the H4 chart to determine directional bias.
+
+    Logic:
+    - Find the two most recent swing highs and two most recent swing lows.
+    - If the latest swing broke above the prior swing high → BULLISH.
+    - If the latest swing broke below the prior swing low  → BEARISH.
+    - Whichever event is more recent wins.
+
+    Returns {"bias": "BULLISH"|"BEARISH"|"NEUTRAL",
+             "detail": str,
+             "swing_high": float|None,
+             "swing_low": float|None}
+    """
+    if df_h4.empty or len(df_h4) < 10:
+        return {"bias": "NEUTRAL", "detail": "Insufficient H4 data", "swing_high": None, "swing_low": None}
+
+    swing_highs, swing_lows = _find_swing_points(df_h4, order=3)
+
+    bullish_break_time = None
+    bearish_break_time = None
+
+    # Check for bullish break of structure (higher high)
+    if len(swing_highs) >= 2:
+        prev_sh, last_sh = swing_highs[-2], swing_highs[-1]
+        if last_sh["price"] > prev_sh["price"]:
+            bullish_break_time = last_sh["time"]
+
+    # Check for bearish break of structure (lower low)
+    if len(swing_lows) >= 2:
+        prev_sl, last_sl = swing_lows[-2], swing_lows[-1]
+        if last_sl["price"] < prev_sl["price"]:
+            bearish_break_time = last_sl["time"]
+
+    latest_sh = swing_highs[-1]["price"] if swing_highs else None
+    latest_sl = swing_lows[-1]["price"] if swing_lows else None
+
+    # Determine which break is more recent
+    if bullish_break_time and bearish_break_time:
+        if bullish_break_time >= bearish_break_time:
+            return {
+                "bias": "BULLISH",
+                "detail": f"H4 Higher High @ {swing_highs[-1]['price']:.5f} ({swing_highs[-1]['time'].strftime('%m-%d %H:%M')})",
+                "swing_high": latest_sh,
+                "swing_low": latest_sl,
+            }
+        else:
+            return {
+                "bias": "BEARISH",
+                "detail": f"H4 Lower Low @ {swing_lows[-1]['price']:.5f} ({swing_lows[-1]['time'].strftime('%m-%d %H:%M')})",
+                "swing_high": latest_sh,
+                "swing_low": latest_sl,
+            }
+    elif bullish_break_time:
+        return {
+            "bias": "BULLISH",
+            "detail": f"H4 Higher High @ {swing_highs[-1]['price']:.5f} ({swing_highs[-1]['time'].strftime('%m-%d %H:%M')})",
+            "swing_high": latest_sh,
+            "swing_low": latest_sl,
+        }
+    elif bearish_break_time:
+        return {
+            "bias": "BEARISH",
+            "detail": f"H4 Lower Low @ {swing_lows[-1]['price']:.5f} ({swing_lows[-1]['time'].strftime('%m-%d %H:%M')})",
+            "swing_high": latest_sh,
+            "swing_low": latest_sl,
+        }
+
+    return {"bias": "NEUTRAL", "detail": "No clear H4 structure break", "swing_high": latest_sh, "swing_low": latest_sl}
+
+
+# ---------------------------------------------------------------------------
+# ICT Logic – Draw on Liquidity
+# ---------------------------------------------------------------------------
+
+def draw_on_liquidity(price: float, pdh: float | None, pdl: float | None, bias: str) -> dict:
+    """
+    Calculate the Draw on Liquidity (DOL) target and distance.
+
+    - BULLISH bias  → price is drawn toward the PDH (buy-side liquidity).
+    - BEARISH bias  → price is drawn toward the PDL (sell-side liquidity).
+    - Also reports distance to both levels regardless of bias.
+    """
+    result = {
+        "target": None,
+        "target_label": None,
+        "target_price": None,
+        "distance_pips": None,
+        "pdh_pips": None,
+        "pdl_pips": None,
+    }
+
+    if pdh is not None:
+        result["pdh_pips"] = round((pdh - price) * 10_000, 1)
+    if pdl is not None:
+        result["pdl_pips"] = round((pdl - price) * 10_000, 1)
+
+    if bias == "BULLISH" and pdh is not None:
+        result["target"] = "PDH (Buy-side Liquidity)"
+        result["target_label"] = "Previous Daily High"
+        result["target_price"] = pdh
+        result["distance_pips"] = result["pdh_pips"]
+    elif bias == "BEARISH" and pdl is not None:
+        result["target"] = "PDL (Sell-side Liquidity)"
+        result["target_label"] = "Previous Daily Low"
+        result["target_price"] = pdl
+        result["distance_pips"] = result["pdl_pips"]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Charting
 # ---------------------------------------------------------------------------
 
@@ -544,6 +706,12 @@ def main():
     except Exception:
         df_other = pd.DataFrame()
 
+    # Fetch H4 data for Directional Bias Engine
+    try:
+        df_h4 = fetch_data(pair, "4h", data_source, api_key)
+    except Exception:
+        df_h4 = pd.DataFrame()
+
     # ---- Compute ICT metrics --------------------------------------------
     last_price = float(df["close"].iloc[-1])
     midnight_open = get_midnight_open(df)
@@ -560,8 +728,29 @@ def main():
     mss_list = detect_mss(df)
     smt_list = detect_smt_divergence(df, df_other) if not df_other.empty else []
 
-    # ---- Header ---------------------------------------------------------
-    st.title(f"ICT Dashboard – {pair}")
+    # Directional Bias Engine (H4)
+    bias_info = determine_h4_bias(df_h4)
+    bias = bias_info["bias"]
+
+    # Draw on Liquidity
+    dol = draw_on_liquidity(last_price, levels.get("pdh"), levels.get("pdl"), bias)
+
+    # ---- Header with Bias Color -----------------------------------------
+    if bias == "BULLISH":
+        header_color = "#00c853"  # green
+    elif bias == "BEARISH":
+        header_color = "#ff1744"  # red
+    else:
+        header_color = "#ffc107"  # amber/neutral
+
+    st.markdown(
+        f'<h1 style="color:{header_color}; margin-bottom:0;">ICT Dashboard – {pair}'
+        f'<span style="font-size:0.5em; margin-left:1em; padding:4px 12px;'
+        f' border-radius:6px; background:{header_color}; color:#fff;">'
+        f'{bias}</span></h1>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"H4 Bias: {bias_info['detail']}")
 
     # ---- Row 1: Live Status + Killzones ---------------------------------
     col1, col2, col3 = st.columns([2, 2, 2])
@@ -608,7 +797,62 @@ def main():
     fig = build_candlestick_chart(df, fvgs, levels, pair, timeframe)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---- Row 3: Signals + Liquidity Radar -------------------------------
+    # ---- Row 3: Directional Bias + Draw on Liquidity --------------------
+    bias_col, dol_col = st.columns(2)
+
+    with bias_col:
+        st.subheader("Directional Bias Engine (H4)")
+        if bias == "BULLISH":
+            st.success(f"**{bias}** — Market structure broke to the upside")
+        elif bias == "BEARISH":
+            st.error(f"**{bias}** — Market structure broke to the downside")
+        else:
+            st.warning(f"**{bias}** — No clear directional break")
+        st.caption(bias_info["detail"])
+        if bias_info["swing_high"] is not None:
+            st.metric("H4 Swing High", f"{bias_info['swing_high']:.5f}")
+        if bias_info["swing_low"] is not None:
+            st.metric("H4 Swing Low", f"{bias_info['swing_low']:.5f}")
+
+    with dol_col:
+        st.subheader("Draw on Liquidity")
+        if dol["target"]:
+            if bias == "BULLISH":
+                st.success(f"Target: **{dol['target']}**")
+            else:
+                st.error(f"Target: **{dol['target']}**")
+            st.metric(
+                dol["target_label"],
+                f"{dol['target_price']:.5f}",
+                delta=f"{dol['distance_pips']} pips remaining",
+            )
+        else:
+            st.info("No DOL target — PDH/PDL data unavailable or bias is NEUTRAL")
+
+        st.markdown("**Distance to Daily Levels**")
+        dol_rows = []
+        if dol["pdh_pips"] is not None:
+            direction = "above" if dol["pdh_pips"] > 0 else "below"
+            dol_rows.append({
+                "Level": "Previous Daily High",
+                "Price": f"{levels['pdh']:.5f}",
+                "Distance": f"{abs(dol['pdh_pips'])} pips {direction}",
+            })
+        if dol["pdl_pips"] is not None:
+            direction = "above" if dol["pdl_pips"] > 0 else "below"
+            dol_rows.append({
+                "Level": "Previous Daily Low",
+                "Price": f"{levels['pdl']:.5f}",
+                "Distance": f"{abs(dol['pdl_pips'])} pips {direction}",
+            })
+        if dol_rows:
+            st.dataframe(pd.DataFrame(dol_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Daily level data not available")
+
+    st.markdown("---")
+
+    # ---- Row 4: Signals + Liquidity Radar -------------------------------
     col_left, col_right = st.columns(2)
 
     with col_left:
